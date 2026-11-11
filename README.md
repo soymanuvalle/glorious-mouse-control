@@ -1,7 +1,7 @@
 # glorious-mouse-control
 ![](hecker.png)
 
-CLI control for Glorious Model D and Model O (wired) mice on Linux.
+CLI control for Glorious Model D and Model O (wired) mice on Linux and macOS.
 
 Currently provides control for
  - [X] DPI Presets
@@ -17,7 +17,8 @@ Currently provides control for
 ## Install
 ### Prerequisites:
  - [Rust Toolchain](https://rustup.rs) (you need this to run `cargo` and build the project)
- - [Libusb](https://libusb.info/) (you probably have this already, if not it should be in your package manager)
+ - Linux: [Libusb](https://libusb.info/) (you probably have this already, if not it should be in your package manager)
+ - macOS: no extra packages (uses the system HID/IOKit stack via hidapi)
 
 ### Quick install
 ```sh
@@ -51,7 +52,25 @@ You can also change the configuration by editing `~/.config/glorious-mouse-contr
 ```
 error: could not open device: Access denied (insufficient permissions)
 ```
-You may need to run the program as root, or grant write access to your mouse some other way.
+or on macOS:
+```
+error: could not open hid device: ... not permitted
+```
+
+**Linux:** run as root, or grant write access to your mouse (udev rules).
+
+**macOS:** Apple’s HID driver owns the mouse, so this tool talks to it through hidapi
+instead of libusb. The config interface also exposes a keyboard HID collection, so
+macOS requires **Input Monitoring** — `sudo` alone is not enough:
+
+1. System Settings → Privacy & Security → **Input Monitoring**
+2. Enable your terminal app (Terminal, Warp, Cursor, iTerm, …). Use **+** if it is missing.
+3. Fully quit that app (**Cmd+Q**) and reopen it (TCC grants apply only after relaunch).
+4. Then run:
+   ```sh
+   sudo $(which glorious-mouse-control) --mode off
+   ```
+5. Optional: quit Glorious Core if it is installed and running.
 
 ## Usage Examples
 
