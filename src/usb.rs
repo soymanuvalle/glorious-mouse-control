@@ -1,10 +1,4 @@
-use std::{
-	io::{self, Write},
-	ops::Deref,
-	time::Duration,
-};
-
-use rusb::{Device, DeviceHandle};
+use std::io::{self, Write};
 
 use crate::{
 	config::{self, Color, Dpi, MouseButtonType, RangedByte},
@@ -17,25 +11,9 @@ static TARGET_DEVICES: &[(u16, u16)] = &[
 	(0x258a, 0x0036), // Model O
 ];
 
-/// Finds a device matching one of [`TARGET_DEVICES`].
-///
-/// # Panics
-///
-/// If no target device is connected, or there is an error finding it,
-/// the program will exit with an error message.
-fn find_device() -> Device<rusb::GlobalContext> {
-	rusb::devices()
-		.unwrap_or_else(|e| error!("could not load usb device list: {e}"))
-		.iter()
-		.find(|device| {
-			let descriptor = device
-				.device_descriptor()
-				.unwrap_or_else(|e| error!("could not get device descriptor: {e}"));
-			let id = (descriptor.vendor_id(), descriptor.product_id());
-			TARGET_DEVICES.iter().any(|target| &id == target)
-		})
-		.unwrap_or_else(|| error!("could not find usb device"))
-}
+/// Vendor-specific HID usage page used by the configuration interface.
+#[cfg(target_os = "macos")]
+const VENDOR_USAGE_PAGE: u16 = 0xff00;
 
 /// Builds a packet matching the `Type 1` section of the `Main Packet`
 /// section of `packet_spec.md`. This packet controls DPI values, DPI states,
@@ -253,49 +231,22 @@ fn build_debounce_packet(config: &config::Config) -> [u8; 6] {
 	]
 }
 
-/// Manages claiming and release of usb device interfaces. (claimed
-/// interfaces will be released and reattached to the kernel (if applicable)
-/// once this struct is dropped)
-struct InterfaceScopeWrapper<'h, const N: usize> {
-	interfaces: [(u8, bool); N],
-	handle: &'h mut DeviceHandle<rusb::GlobalContext>,
-}
-
-impl<'h, const N: usize> InterfaceScopeWrapper<'h, N> {
-	fn wrap(handle: &'h mut DeviceHandle<rusb::GlobalContext>, interfaces: [u8; N]) -> Self {
-		Self {
-			interfaces: interfaces.map(|interface| {
-				let attached = rusb::supports_detach_kernel_driver()
-					&& handle.kernel_driver_active(interface).unwrap();
-				if attached {
-					handle.detach_kernel_driver(interface).unwrap();
-				}
-				handle.claim_interface(interface).unwrap();
-
-				(interface, attached)
-			}),
-			handle,
-		}
-	}
-}
-
-impl<'h, const N: usize> Drop for InterfaceScopeWrapper<'h, N> {
-	fn drop(&mut self) {
-		for (interface, attached) in self.interfaces {
-			self.handle.release_interface(interface).unwrap();
-			if attached {
-				self.handle.attach_kernel_driver(interface).unwrap();
-			}
-		}
-	}
-}
-
-impl<'h, const N: usize> Deref for InterfaceScopeWrapper<'h, N> {
-	type Target = DeviceHandle<rusb::GlobalContext>;
-
-	fn deref(&self) -> &Self::Target {
-		self.handle
-	}
+fn access_denied_hint(context: &str) -> ! {
+	#[cfg(target_os = "macos")]
+	error!(
+		"{context}\n\
+		hint: macOS blocks this because the mouse config interface also exposes a keyboard HID collection.\n\
+		      sudo alone is not enough — grant Input Monitoring, then fully quit/reopen the terminal:\n\
+		      1. System Settings → Privacy & Security → Input Monitoring\n\
+		      2. Enable your terminal app (Terminal, Warp, Cursor, etc.) — use + if it is missing\n\
+		      3. Quit that app completely (Cmd+Q) and reopen it\n\
+		      4. Run: sudo $(which glorious-mouse-control) ..."
+	);
+	#[cfg(not(target_os = "macos"))]
+	error!(
+		"{context}\n\
+		hint: you may need to run as root, or grant write access to your mouse (udev rules)"
+	);
 }
 
 /// Applies the specified `config` to a connected target device.
@@ -304,25 +255,170 @@ impl<'h, const N: usize> Deref for InterfaceScopeWrapper<'h, N> {
 ///
 /// See [`build_main_packet`]
 pub fn apply_config(config: &config::Config) {
-	let device = find_device();
-
 	let main_packet = build_main_packet(config);
 	let buttons_packet = build_buttons_packet(config);
 	let debounce_packet = build_debounce_packet(config);
 
-	let mut handle = device
-		.open()
-		.unwrap_or_else(|e| error!("could not open usb device: {e}"));
+	send_packets(&main_packet, &buttons_packet, &debounce_packet);
+}
 
-	let handle = InterfaceScopeWrapper::wrap(&mut handle, [0, 1]);
+#[cfg(target_os = "macos")]
+fn send_packets(main_packet: &[u8], buttons_packet: &[u8], debounce_packet: &[u8]) {
+	use hidapi::HidApi;
 
-	handle
-		.write_control(0x21, 0x09, 0x0304, 0x1, &main_packet, Duration::from_secs(5))
-		.unwrap();
-	handle
-		.write_control(0x21, 0x09, 0x0304, 0x1, &buttons_packet, Duration::from_secs(5))
-		.unwrap();
-	handle
-		.write_control(0x21, 0x09, 0x0305, 0x1, &debounce_packet, Duration::from_secs(5))
-		.unwrap();
+	let api = HidApi::new().unwrap_or_else(|e| error!("could not initialize hidapi: {e}"));
+	// Shared mode: do not seize the pointer/keyboard from the system HID stack.
+	api.set_open_exclusive(false);
+
+	// Prefer the vendor collection on interface 1 (matches USB wIndex=0x1).
+	// Note: on this mouse, interface 1 also includes a keyboard usage, so macOS
+	// gates IOHIDDeviceOpen behind Input Monitoring for the calling terminal.
+	let info = api
+		.device_list()
+		.find(|device| {
+			let id = (device.vendor_id(), device.product_id());
+			TARGET_DEVICES.iter().any(|target| &id == target)
+				&& device.interface_number() == 1
+				&& device.usage_page() == VENDOR_USAGE_PAGE
+		})
+		.or_else(|| {
+			api.device_list().find(|device| {
+				let id = (device.vendor_id(), device.product_id());
+				TARGET_DEVICES.iter().any(|target| &id == target) && device.interface_number() == 1
+			})
+		})
+		.unwrap_or_else(|| error!("could not find usb device"));
+
+	let device = info.open_device(&api).unwrap_or_else(|e| {
+		let msg = e.to_string();
+		if msg.contains("not permitted") || msg.contains("Access") || msg.contains("Permission") {
+			access_denied_hint(&format!("could not open hid device: {e}"));
+		}
+		error!("could not open hid device: {e}")
+	});
+
+	for (label, packet) in [
+		("main", main_packet),
+		("buttons", buttons_packet),
+		("debounce", debounce_packet),
+	] {
+		device.send_feature_report(packet).unwrap_or_else(|e| {
+			let msg = e.to_string();
+			if msg.contains("not permitted") || msg.contains("Access") || msg.contains("Permission") {
+				access_denied_hint(&format!("could not send {label} feature report: {e}"));
+			}
+			error!("could not send {label} feature report: {e}")
+		});
+	}
+}
+
+#[cfg(not(target_os = "macos"))]
+mod libusb_backend {
+	use std::{ops::Deref, time::Duration};
+
+	use rusb::{Device, DeviceHandle};
+
+	use super::{TARGET_DEVICES, access_denied_hint};
+	use crate::error;
+
+	/// Finds a device matching one of [`TARGET_DEVICES`].
+	fn find_device() -> Device<rusb::GlobalContext> {
+		rusb::devices()
+			.unwrap_or_else(|e| error!("could not load usb device list: {e}"))
+			.iter()
+			.find(|device| {
+				let descriptor = device
+					.device_descriptor()
+					.unwrap_or_else(|e| error!("could not get device descriptor: {e}"));
+				let id = (descriptor.vendor_id(), descriptor.product_id());
+				TARGET_DEVICES.iter().any(|target| &id == target)
+			})
+			.unwrap_or_else(|| error!("could not find usb device"))
+	}
+
+	/// Manages claiming and release of usb device interfaces. (claimed
+	/// interfaces will be released and reattached to the kernel (if applicable)
+	/// once this struct is dropped)
+	struct InterfaceScopeWrapper<'h, const N: usize> {
+		interfaces: [(u8, bool); N],
+		handle: &'h mut DeviceHandle<rusb::GlobalContext>,
+	}
+
+	impl<'h, const N: usize> InterfaceScopeWrapper<'h, N> {
+		fn wrap(handle: &'h mut DeviceHandle<rusb::GlobalContext>, interfaces: [u8; N]) -> Self {
+			Self {
+				interfaces: interfaces.map(|interface| {
+					let attached = rusb::supports_detach_kernel_driver()
+						&& handle
+							.kernel_driver_active(interface)
+							.unwrap_or_else(|e| error!("could not query kernel driver on interface {interface}: {e}"));
+					if attached {
+						handle.detach_kernel_driver(interface).unwrap_or_else(|e| {
+							error!("could not detach kernel driver from interface {interface}: {e}")
+						});
+					}
+					handle.claim_interface(interface).unwrap_or_else(|e| {
+						if matches!(e, rusb::Error::Access) {
+							access_denied_hint(&format!(
+								"could not claim usb interface {interface}: {e}"
+							));
+						}
+						error!("could not claim usb interface {interface}: {e}")
+					});
+
+					(interface, attached)
+				}),
+				handle,
+			}
+		}
+	}
+
+	impl<'h, const N: usize> Drop for InterfaceScopeWrapper<'h, N> {
+		fn drop(&mut self) {
+			for (interface, attached) in self.interfaces {
+				let _ = self.handle.release_interface(interface);
+				if attached {
+					let _ = self.handle.attach_kernel_driver(interface);
+				}
+			}
+		}
+	}
+
+	impl<'h, const N: usize> Deref for InterfaceScopeWrapper<'h, N> {
+		type Target = DeviceHandle<rusb::GlobalContext>;
+
+		fn deref(&self) -> &Self::Target {
+			self.handle
+		}
+	}
+
+	pub fn send_packets(main_packet: &[u8], buttons_packet: &[u8], debounce_packet: &[u8]) {
+		let device = find_device();
+
+		let mut handle = device.open().unwrap_or_else(|e| {
+			if matches!(e, rusb::Error::Access) {
+				access_denied_hint(&format!("could not open usb device: {e}"));
+			}
+			error!("could not open usb device: {e}")
+		});
+
+		// Only interface 1 is used by the HID Set_Report control transfers
+		// (wIndex = 0x1). Claiming interface 0 is unnecessary.
+		let handle = InterfaceScopeWrapper::wrap(&mut handle, [1]);
+
+		handle
+			.write_control(0x21, 0x09, 0x0304, 0x1, main_packet, Duration::from_secs(5))
+			.unwrap_or_else(|e| error!("could not send main packet: {e}"));
+		handle
+			.write_control(0x21, 0x09, 0x0304, 0x1, buttons_packet, Duration::from_secs(5))
+			.unwrap_or_else(|e| error!("could not send buttons packet: {e}"));
+		handle
+			.write_control(0x21, 0x09, 0x0305, 0x1, debounce_packet, Duration::from_secs(5))
+			.unwrap_or_else(|e| error!("could not send debounce packet: {e}"));
+	}
+}
+
+#[cfg(not(target_os = "macos"))]
+fn send_packets(main_packet: &[u8], buttons_packet: &[u8], debounce_packet: &[u8]) {
+	libusb_backend::send_packets(main_packet, buttons_packet, debounce_packet);
 }
